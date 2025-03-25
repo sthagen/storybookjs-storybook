@@ -13,13 +13,6 @@ interface PresetOptions {
   backgrounds?: boolean;
   configDir: string;
   /**
-   * Allow to use @storybook/addon-controls
-   *
-   * @default true
-   * @see https://storybook.js.org/addons/@storybook/addon-controls
-   */
-  controls?: boolean;
-  /**
    * Allow to use @storybook/addon-measure
    *
    * @default true
@@ -34,20 +27,6 @@ interface PresetOptions {
    */
   outline?: boolean;
   themes?: boolean;
-  /**
-   * Allow to use @storybook/addon-toolbars
-   *
-   * @default true
-   * @see https://storybook.js.org/addons/@storybook/addon-toolbars
-   */
-  toolbars?: boolean;
-  /**
-   * Allow to use @storybook/addon-viewport
-   *
-   * @default true
-   * @see https://storybook.js.org/addons/@storybook/addon-viewport
-   */
-  viewport?: boolean;
 }
 
 const requireMain = (configDir: string) => {
@@ -73,7 +52,7 @@ export function addons(options: PresetOptions) {
   const main = requireMain(options.configDir);
 
   // NOTE: The order of these addons is important.
-  return ['controls', 'backgrounds', 'viewport', 'toolbars', 'measure', 'outline', 'highlight']
+  return ['backgrounds', 'measure', 'outline', 'highlight']
     .filter((key) => (options as any)[key] !== false)
     .filter((addon) => !checkInstalled(addon, main))
     .map((addon) => {
