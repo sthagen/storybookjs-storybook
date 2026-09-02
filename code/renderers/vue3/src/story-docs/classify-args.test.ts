@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 
 import { babelParse, types as t } from 'storybook/internal/babel';
 
-import { classifyArgs, type ClassifiedArg, type ClassifyArgsResult } from './classify-args.ts';
+import { classifyArgs, type ClassifiedArg } from './classify-args.ts';
 import { printValue } from './classify-value.ts';
 
 interface DocgenFixture {
@@ -11,8 +11,10 @@ interface DocgenFixture {
   events?: string[];
 }
 
-interface ReadableClassifyArgsResult extends Omit<ClassifyArgsResult, 'args'> {
+interface ReadableClassifyArgsResult {
   args: string[];
+  unset?: string[];
+  unresolved?: string[];
 }
 
 describe('classifyArgs', () => {
@@ -39,11 +41,17 @@ describe('classifyArgs', () => {
     });
   });
 
+  it('tracks an arg explicitly set to undefined without naming it unresolved', () => {
+    expect(classify(`{ a: undefined, label: 'ok' }`)).toEqual({
+      args: [`label: 'ok' -> prop (inline)`],
+      unset: ['a'],
+    });
+  });
+
   it.each([
-    { label: 'undefined', value: 'undefined' },
     { label: 'a function', value: '() => null' },
     { label: 'an empty string', value: `''` },
-  ])('drops an arg set to $label without warning', ({ value }) => {
+  ])('drops an arg set to $label without naming it', ({ value }) => {
     expect(classify(`{ a: ${value}, label: 'ok' }`)).toEqual({
       args: [`label: 'ok' -> prop (inline)`],
     });
@@ -52,15 +60,14 @@ describe('classifyArgs', () => {
   it('omits an unresolvable arg, keeps the rest, and names the omission', () => {
     expect(classify(`{ label: 'ok', size: Sizes.LARGE }`)).toEqual({
       args: [`label: 'ok' -> prop (inline)`],
-      warning: 'Omitted args that cannot be resolved statically: size: Sizes.LARGE',
+      unresolved: ['size: Sizes.LARGE'],
     });
   });
 
-  it('names every omitted arg in the warning', () => {
+  it('names every unresolved arg', () => {
     expect(classify(`{ label: 'ok', size: SOME_CONST, items: makeItems(3) }`)).toEqual({
       args: [`label: 'ok' -> prop (inline)`],
-      warning:
-        'Omitted args that cannot be resolved statically: size: SOME_CONST, items: makeItems(3)',
+      unresolved: ['size: SOME_CONST', 'items: makeItems(3)'],
     });
   });
 
@@ -68,18 +75,21 @@ describe('classifyArgs', () => {
     const result = classify(`{ label: 'ok', options: { ...BASE_OPTIONS } }`);
 
     expect(result.args).toEqual([`label: 'ok' -> prop (inline)`]);
-    expect(result.warning).toContain('BASE_OPTIONS');
+    expect(result.unresolved?.[0]).toContain('BASE_OPTIONS');
   });
 
-  it('defers when nothing the story sets can be rendered', () => {
-    expect(classify(`{ label: SOME_CONST }`)).toEqual({ args: [], defer: true });
+  it('names every arg when nothing the story sets can be rendered', () => {
+    expect(classify(`{ label: SOME_CONST }`)).toEqual({
+      args: [],
+      unresolved: ['label: SOME_CONST'],
+    });
   });
 
   it('still renders a story whose only args are dropped silently', () => {
     expect(classify(`{ onClick: () => null }`)).toEqual({ args: [] });
   });
 
-  it('defers the whole story when a slot receives a function', () => {
+  it('forwards a function slot whose content only a render-tree renderer can realize', () => {
     expect(
       classify(
         `{
@@ -88,7 +98,9 @@ describe('classifyArgs', () => {
         }`,
         { slots: ['default'] }
       )
-    ).toEqual({ args: [], defer: true });
+    ).toEqual({
+      args: [`default: () => h(Child) -> slot (function-slot)`, `label: 'ok' -> prop (inline)`],
+    });
   });
 
   it('renders a slot function that returns a string literal', () => {
@@ -103,19 +115,17 @@ describe('classifyArgs', () => {
     });
   });
 
-  it('defers the whole story when a slot function has a multi-statement body', () => {
+  it('forwards a multi-statement slot function instead of inlining its return', () => {
     expect(
-      classify(
-        `{
-          default: () => {
-            sideEffect();
-            return 'hi';
-          },
-          label: 'ok',
-        }`,
-        { slots: ['default'] }
-      )
-    ).toEqual({ args: [], defer: true });
+      classify(`{ default: () => { sideEffect(); return 'hi'; }, label: 'ok' }`, {
+        slots: ['default'],
+      })
+    ).toEqual({
+      args: [
+        `default: () => { sideEffect(); return 'hi'; } -> slot (function-slot)`,
+        `label: 'ok' -> prop (inline)`,
+      ],
+    });
   });
 
   it('classifies a function arg matching a declared event as a listener', () => {
@@ -124,10 +134,10 @@ describe('classifyArgs', () => {
     });
   });
 
-  it('warns when a declared event arg value is not a function expression', () => {
+  it('names a declared event arg whose value is not a function expression', () => {
     expect(classify(`{ label: 'ok', onSubmit: fn() }`, { events: ['submit'] })).toEqual({
       args: [`label: 'ok' -> prop (inline)`],
-      warning: 'Omitted args that cannot be resolved statically: onSubmit: fn()',
+      unresolved: ['onSubmit: fn()'],
     });
   });
 
@@ -138,8 +148,7 @@ describe('classifyArgs', () => {
       })
     ).toEqual({
       args: [`label: 'ok' -> prop (inline)`],
-      warning:
-        'Omitted args that cannot be resolved statically: onSubmit: value => formatHelper(value)',
+      unresolved: ['onSubmit: value => formatHelper(value)'],
     });
   });
 
@@ -148,7 +157,7 @@ describe('classifyArgs', () => {
       classify(`{ label: 'ok', formatter: () => SOME_CONST }`, { props: ['formatter'] })
     ).toEqual({
       args: [`label: 'ok' -> prop (inline)`],
-      warning: 'Omitted args that cannot be resolved statically: formatter: () => SOME_CONST',
+      unresolved: ['formatter: () => SOME_CONST'],
     });
   });
 
@@ -158,7 +167,7 @@ describe('classifyArgs', () => {
     });
   });
 
-  it('reports no warning when every arg renders', () => {
+  it('reports nothing unresolved when every arg renders', () => {
     expect(classify(`{ label: 'ok' }`)).toEqual({
       args: [`label: 'ok' -> prop (inline)`],
     });
@@ -176,8 +185,9 @@ function classify(
   });
 
   return {
-    ...result,
     args: result.args.map(formatArg),
+    ...(result.unset.size > 0 ? { unset: Array.from(result.unset) } : {}),
+    ...(result.unresolved.length > 0 ? { unresolved: result.unresolved } : {}),
   };
 }
 
@@ -206,7 +216,8 @@ function parseArgs(code: string): Record<string, t.Node> {
   );
 }
 
-function formatArg({ name, value, role, eventName, plan }: ClassifiedArg): string {
-  const destination = eventName ? `${role}:${eventName}` : role;
-  return `${name}: ${printValue(value)} -> ${destination} (${plan.kind})`;
+function formatArg(arg: ClassifiedArg): string {
+  const destination =
+    arg.role === 'event' && arg.eventName ? `${arg.role}:${arg.eventName}` : arg.role;
+  return `${arg.name}: ${printValue(arg.value)} -> ${destination} (${arg.plan.kind})`;
 }

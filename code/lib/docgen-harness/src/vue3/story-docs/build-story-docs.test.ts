@@ -68,9 +68,34 @@ function docgenForFixture(
     'function-slot': {
       default: argType('default', 'slots'),
     },
+    'function-slot-bail': {
+      default: argType('default', 'slots'),
+      footer: argType('footer', 'slots'),
+    },
+    'h-args-expression': {
+      count: argType('count', 'props'),
+      label: argType('label', 'props'),
+    },
     'prop-slot-collision': {
       default: argType('default', 'props'),
       icon: argType('icon', 'props'),
+    },
+    'setup-computed': {
+      hint: argType('hint', 'props'),
+      label: argType('label', 'props'),
+    },
+    'setup-local-helper-bail': {
+      badge: argType('badge', 'props'),
+      label: argType('label', 'props'),
+    },
+    'setup-ref-plus-handler': {
+      count: argType('count', 'props'),
+      increment: argType('increment', 'events'),
+      label: argType('label', 'props'),
+    },
+    'setup-renamed-args': {
+      label: argType('label', 'props'),
+      title: argType('title', 'props'),
     },
     'slot-scoped': {
       item: argType('item', 'slots'),
@@ -79,12 +104,28 @@ function docgenForFixture(
       default: argType('default', 'slots'),
       header: argType('header', 'slots'),
     },
+    'template-escaped-interpolation': {
+      label: argType('label', 'props'),
+    },
+    'template-unset-args': {
+      clear: argType('clear', 'events'),
+      hint: argType('hint', 'props'),
+      id: argType('id', 'props'),
+      label: argType('label', 'props'),
+      modelValue: argType('modelValue', 'props'),
+      'update:modelValue': argType('update:modelValue', 'events'),
+    },
+    'template-v-model-expansion': {
+      label: argType('label', 'props'),
+      'update:modelValue': argType('update:modelValue', 'events'),
+    },
     'v-model': {
       'update:checked': argType('update:checked', 'events'),
       'update:modelValue': argType('update:modelValue', 'events'),
     },
   };
-
+  // Deliberately empty: vue-component-meta does not surface component-level tags, so the
+  // `import-override` fixture has to earn its snapshot from the `@import` tag on its CSF meta.
   return {
     id,
     name: componentNameFromFixture(fixtureCase),

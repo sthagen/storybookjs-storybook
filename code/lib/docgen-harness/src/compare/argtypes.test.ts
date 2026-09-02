@@ -14,6 +14,12 @@ describe('compareArgTypes', () => {
     expect(violations).toEqual([expect.objectContaining({ arg: 'size', kind: 'lost-arg' })]);
   });
 
+  it('waives a lost ES-private member, which no modern engine is expected to record', () => {
+    const baseline = argTypes({ '#secret': { name: '#secret', type: { name: 'string' } } });
+
+    expect(compareArgTypes(baseline, argTypes({}))).toEqual([]);
+  });
+
   it('passes when the candidate has keys the baseline lacks', () => {
     const candidate = argTypes({
       size: { name: 'size', type: { name: 'string' } },
@@ -157,6 +163,20 @@ describe('compareArgTypes', () => {
       const candidate = argTypes({ count: { name: 'count' } });
       expect(compareArgTypes(baseline, candidate, { legacyBaseline: true })).toEqual([]);
     }
+  });
+
+  it('does not generically waive numeric initializer source from a legacy baseline', () => {
+    const baseline = argTypes({
+      timeoutMs: {
+        name: 'timeoutMs',
+        table: { defaultValue: { summary: '5 * 60 * 1000' } },
+      },
+    });
+    const candidate = argTypes({ timeoutMs: { name: 'timeoutMs' } });
+
+    expect(compareArgTypes(baseline, candidate, { legacyBaseline: true })).toEqual([
+      expect.objectContaining({ arg: 'timeoutMs', kind: 'lost-default' }),
+    ]);
   });
 
   it('flags dropped raw false, null, and NaN defaults outside legacyBaseline', () => {
@@ -639,16 +659,15 @@ describe('compareArgTypes', () => {
     ]);
   });
 
-  it('flags a table.type.required true->false flip only under strictTable', () => {
+  // `canonicalType` ignores `required`, so the type-fidelity comparison cannot see this flip and
+  // this gate is the only thing standing between a lost required flag and a laundered `-u`.
+  it('flags a required true->false flip only under strictTable', () => {
     const required = (value: boolean) =>
       argTypes({
-        count: {
-          name: 'count',
-          table: { type: { required: value, summary: 'number' } as never },
-        },
+        count: { name: 'count', type: { name: 'number', required: value } },
       });
     const missing = argTypes({
-      count: { name: 'count', table: { type: { summary: 'number' } } },
+      count: { name: 'count', type: { name: 'number' } },
     });
     expect(compareArgTypes(required(true), required(false))).toEqual([]);
     expect(compareArgTypes(required(true), required(false), { strictTable: true })).toEqual([

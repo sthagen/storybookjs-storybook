@@ -10,29 +10,39 @@ import {
 import { getService } from 'storybook/internal/core-server';
 import { storyNameFromExport } from 'storybook/internal/csf';
 import {
-  argsRecordFromObjectPath,
   buildImportStatements,
   collectImportBindings,
+  createStoryArgsResolver,
+  createStoryReferenceResolver,
   extractStoryJSDocInfo,
+  jsDocTagsForPath,
   keyOf,
   loadCsf,
-  mergeArgsRecords,
   metaObjectPath,
+  noSnippetWarning,
   normalizeStoryDeclaration,
   propertyValue,
   resolveComponentImport,
   resolveRenderFunction,
-  returnedObjectExpression,
-  storyAssignedArgsPath,
+  resolveReturnedObjectExpression,
+  returnedExpression,
+  returnedExpressionPath,
+  unresolvedWarning,
+  unwrapExpression,
   type ImportBinding,
+  type ReferenceContext,
   type RenderFunctionPath,
   type RenderResolution,
+  type StoryArgsResolver,
+  type StoryReferenceResolver,
 } from 'storybook/internal/csf-tools';
 import type { StoryDoc, StoryDocsPayload, StoryDocsProviderInput } from 'storybook/internal/types';
 import type { DocgenPayload, DocgenService } from 'storybook/open-service';
 
-import { classifyArgs, type ClassifiedArg, type VueDocgenArgInfo } from './classify-args.ts';
-import { renderSfcSnippet } from './render-sfc.ts';
+import { classifyArgs, type ClassifyArgsResult, type VueDocgenArgInfo } from './classify-args.ts';
+import type { ForwardableSetup } from './forward-setup.ts';
+import { printH } from './print-h.ts';
+import { createRenderContext } from './render-primitives.ts';
 import {
   readTemplateRenderConfig,
   transformTemplate,
@@ -44,10 +54,13 @@ export interface BuildStoryDocsContext {
   resolvePath?: (importPath: string) => string;
   /** Reads docgen for the component id. Defaults to the registered core/docgen service. */
   readDocgen?: (id: string) => Promise<DocgenPayload | undefined>;
+  /** How args follow a reference out of the story file. Defaults to resolving against disk. */
+  references?: StoryReferenceResolver;
 }
 
 interface StorySnippetContext {
   componentName: string;
+  componentImportStatement: string | undefined;
   docgenArgInfo: VueDocgenArgInfo;
 }
 
@@ -56,25 +69,49 @@ interface StoryDocsContext {
   snippet: StorySnippetContext | undefined;
   importBindings: Map<string, ImportBinding>;
   metaPath: NodePath<t.ObjectExpression> | undefined;
+  /** Resolves each story's args, following a spread or a name out of the story file. */
+  resolver: StoryArgsResolver;
+  /** Story file source, for forwarding setup statements verbatim. */
+  source: string;
 }
 
+// Vue's single-file-component format is tried ahead of the JS/TS extensions, matching how a story
+// file resolves an import of a `.vue` module.
+const openStoryReferences = createStoryReferenceResolver({ extensions: ['.vue'] });
+
+const RENDER_UNRESOLVED_WARNING =
+  'No static snippet: the `render` function could not be resolved statically.';
+const SLOT_UNRESOLVED_WARNING =
+  'No static snippet: a slot function could not be resolved statically.';
+const IMPORT_UNRESOLVED_WARNING =
+  "No static snippet: the component's import could not be resolved statically.";
+const TEMPLATE_UNRESOLVED_WARNING =
+  'No static snippet: the story template could not be resolved statically.';
+const UNRENDERED_WARNINGS: Record<Exclude<StaticStoryRenderer, { kind: 'bail' }>['kind'], string> =
+  {
+    h: RENDER_UNRESOLVED_WARNING,
+    sfc: SLOT_UNRESOLVED_WARNING,
+    template: TEMPLATE_UNRESOLVED_WARNING,
+  };
+
 type ParsedCsf = ReturnType<ReturnType<typeof loadCsf>['parse']>;
-type ArgsObjectPath = NodePath<t.ObjectExpression>;
-type StoryDocResult = { doc: StoryDoc; imports: string[] };
-type ExtractStoriesResult = { stories: Record<string, StoryDoc>; imports: string[] };
+type ExtractStoriesResult = { stories: Record<string, StoryDoc> };
 type StaticStoryRenderer =
+  | { kind: 'bail'; warning: string }
+  | { kind: 'h'; argsParam?: string; expression: t.Expression }
   | { kind: 'sfc' }
   | {
       kind: 'template';
       componentImports: TemplateRenderConfig['componentImports'];
       template: string;
+      setup?: ForwardableSetup;
     };
-type StorySnippetResult = { snippet: string; imports: string[] };
-type StaticStoryArgs =
-  | { kind: 'error'; error: NonNullable<StoryDoc['error']> }
-  | { kind: 'classified'; classified: ReturnType<typeof classifyArgs> };
-
-const ARGS_PROPERTY = 'args';
+type StorySnippetResult = { snippet: string };
+type StaticStoryArgs = {
+  classified: ClassifyArgsResult;
+  /** Source text of everything reading the args statically could not account for. */
+  unresolved: string[];
+};
 
 /**
  * Builds Vue story-docs metadata without snippets so runtime source fallback remains authoritative.
@@ -118,20 +155,33 @@ export async function buildStoryDocsPayload(
   }
   const componentName = resolveMetaComponentIdentifier(metaPath);
   const importBindings = collectImportBindings(csf._file.path);
-  const importStatement = createImportStatement(componentName, importBindings);
+  const importStatement = createImportStatement(
+    componentName,
+    importBindings,
+    metaPath,
+    docgenPayload
+  );
   const docgenArgInfo =
     docgenPayload && !docgenPayload.error ? vueDocgenArgInfo(docgenPayload) : undefined;
-  const snippet = componentName && docgenArgInfo ? { componentName, docgenArgInfo } : undefined;
-  const extracted = extractStories(csf, { snippet, importBindings, metaPath });
-  const importCode = Array.from(
-    new Set([importStatement, ...extracted.imports].filter((line): line is string => Boolean(line)))
-  ).join('\n');
+  const snippet =
+    componentName && docgenArgInfo
+      ? { componentName, componentImportStatement: importStatement, docgenArgInfo }
+      : undefined;
+  const extracted = extractStories(csf, {
+    snippet,
+    importBindings,
+    metaPath,
+    resolver: createStoryArgsResolver(csf, {
+      filePath: storyPath,
+      ...(context.references ?? openStoryReferences()),
+    }),
+    source: storyFile,
+  });
 
   return {
     id,
     name: componentName ?? docgenPayload?.name ?? fallbackTitle(input.entry.title),
     path: storyFilePath,
-    ...(importCode ? { import: importCode } : {}),
     stories: extracted.stories,
   };
 }
@@ -155,18 +205,31 @@ function resolveMetaComponentIdentifier(
 }
 
 /**
- * Reconstructs the component's import statement from the story file's import bindings.
+ * Reconstructs the component's import statement from the story file's import bindings, redirected
+ * to the source an `@import` tag declares when the story or the component carries one.
+ *
+ * The CSF `meta` docblock is the supported place to write it, because component-level tags do not
+ * survive every docgen backend. A component tag still wins over nothing when one does come through.
+ *
+ * @example `@import import { Button } from 'my-ds'` above `const meta` for `MyButton` →
+ * `import { Button as MyButton } from 'my-ds';`
  */
 function createImportStatement(
   componentName: string | undefined,
-  importBindings: Map<string, ImportBinding>
+  importBindings: Map<string, ImportBinding>,
+  metaPath: NodePath<t.ObjectExpression> | undefined,
+  docgenPayload: DocgenPayload | undefined
 ): string | undefined {
   if (!componentName) {
     return undefined;
   }
 
+  // The override supplies the source and specifier kind, but the local name has to stay the one the
+  // snippet renders, so the statement and the snippet keep referring to the same identifier.
   const ref = resolveComponentImport(componentName, importBindings);
-  return buildImportStatements({ refs: [ref] }).join('\n') || undefined;
+  const importOverride =
+    jsDocTagsForPath(metaPath).import?.[0] ?? docgenPayload?.jsDocTags.import?.[0];
+  return buildImportStatements({ refs: [{ ...ref, importOverride }] }).join('\n') || undefined;
 }
 
 /**
@@ -200,34 +263,9 @@ function vueDocgenArgInfo(payload: DocgenPayload): VueDocgenArgInfo {
 }
 
 /**
- * AST path of the `args` property when its value is an object literal.
- *
- * @example `{ args: { label: 'Hi' } }` → path of `{ label: 'Hi' }`; `{ args: shared }` → undefined
- */
-function argsObjectPathFromObjectPath(
-  path?: NodePath<t.ObjectExpression>
-): ArgsObjectPath | undefined {
-  const property = path
-    ?.get('properties')
-    .find((prop) => prop.isObjectProperty() && keyOf(prop.node) === ARGS_PROPERTY);
-
-  if (!property?.isObjectProperty()) {
-    return undefined;
-  }
-
-  const value = property.get('value');
-  return value.isObjectExpression() ? value : undefined;
-}
-
-function argsObjectHasSpread(object: t.ObjectExpression | undefined): boolean {
-  return object?.properties.some((property) => property.type === 'SpreadElement') ?? false;
-}
-
-/**
  * Maps every CSF story export to its StoryDoc, enriched with a snippet or error where possible.
  */
 function extractStories(csf: ParsedCsf, options: StoryDocsContext): ExtractStoriesResult {
-  const imports = new Set<string>();
   const stories = Object.fromEntries(
     Object.entries(csf._stories).map(([storyExport, story]): [string, StoryDoc] => {
       const { description, summary } = extractStoryJSDocInfo(csf._storyStatements[storyExport]);
@@ -238,31 +276,37 @@ function extractStories(csf: ParsedCsf, options: StoryDocsContext): ExtractStori
         summary,
       };
       const enriched = enrichStoryDoc(csf, storyExport, storyDoc, options);
-      for (const importStatement of enriched.imports) {
-        imports.add(importStatement);
-      }
-      return [story.id, enriched.doc];
+      return [story.id, enriched];
     })
   );
 
-  return { imports: Array.from(imports), stories };
+  return { stories };
 }
 
 /**
- * Attaches a synthesized snippet (or an "unsupported args" error) to a story doc.
+ * Attaches a synthesized snippet to a story doc, or a standalone `warning` saying why none could
+ * be produced.
+ *
+ * The runtime source decorator still renders an exact snippet in the browser, but payload
+ * consumers that never run the story (manifests, agents) would otherwise see nothing at all, so
+ * every statically unresolvable story names what could not be read instead of staying silent.
+ * Only stories outside the provider's scope (CSF2 function stories, unreadable declarations,
+ * missing docgen) stay unmarked.
  */
 function enrichStoryDoc(
   csf: ParsedCsf,
   storyExport: string,
   storyDoc: StoryDoc,
   options: StoryDocsContext
-): StoryDocResult {
-  const plain: StoryDocResult = { doc: storyDoc, imports: [] };
+): StoryDoc {
+  const plain = storyDoc;
+  const withWarning = (warning: string | undefined): StoryDoc =>
+    warning ? { ...storyDoc, warning } : plain;
 
   if (!options.snippet) {
     return plain;
   }
-  const { componentName, docgenArgInfo } = options.snippet;
+  const { componentName, componentImportStatement, docgenArgInfo } = options.snippet;
 
   let normalized;
   try {
@@ -279,7 +323,8 @@ function enrichStoryDoc(
   const effectiveRender = resolveEffectiveRender(
     storyConfigPath,
     options.metaPath,
-    csf._storyDeclarationPath[storyExport]
+    csf._storyDeclarationPath[storyExport],
+    options.resolver.ctx
   );
   const renderer =
     effectiveRender.kind === 'resolved'
@@ -288,40 +333,44 @@ function enrichStoryDoc(
         ? { kind: 'sfc' as const }
         : undefined;
   if (!renderer) {
-    return plain;
+    return withWarning(RENDER_UNRESOLVED_WARNING);
+  }
+  if (renderer.kind === 'bail') {
+    return withWarning(renderer.warning);
   }
 
-  const resolved = resolveStaticStoryArgs(
-    csf,
-    storyExport,
+  // The SFC renderer needs the component's import statement; without one, the bail below would
+  // otherwise blame a slot that was never involved.
+  if (renderer.kind === 'sfc' && !componentImportStatement) {
+    return withWarning(IMPORT_UNRESOLVED_WARNING);
+  }
+
+  const resolved = resolveStaticStoryArgs(storyExport, docgenArgInfo, options);
+  const { classified } = resolved;
+  const { args, unresolved: classifyUnresolved } = classified;
+  const unresolved = [...classifyUnresolved, ...resolved.unresolved];
+
+  // A snippet showing none of the args the story actually sets would be a worse example than the
+  // runtime one, so no snippet is emitted and the warning names everything that was dropped.
+  if (args.length === 0 && unresolved.length > 0) {
+    return withWarning(noSnippetWarning(unresolved));
+  }
+
+  const rendered = renderStaticStorySnippet(
+    renderer,
+    classified,
+    componentName,
     docgenArgInfo,
-    options.metaPath,
-    storyConfigPath
+    options
   );
-  if (resolved.kind === 'error') {
-    // Only the SFC path reports arg errors; render-function stories defer to runtime source.
-    return renderer.kind === 'sfc'
-      ? { doc: { ...storyDoc, error: resolved.error }, imports: [] }
-      : plain;
-  }
-
-  const classified = resolved.classified;
-  if (classified.defer) {
-    return plain;
-  }
-
-  const rendered = renderStaticStorySnippet(renderer, classified.args, componentName);
   if (!rendered) {
-    return plain;
+    return withWarning(UNRENDERED_WARNINGS[renderer.kind]);
   }
 
   return {
-    doc: {
-      ...storyDoc,
-      snippet: rendered.snippet,
-      ...(classified.warning ? { warning: classified.warning } : {}),
-    },
-    imports: rendered.imports,
+    ...storyDoc,
+    snippet: rendered.snippet,
+    ...(unresolved.length > 0 ? { warning: unresolvedWarning(unresolved) } : {}),
   };
 }
 
@@ -329,115 +378,180 @@ function staticRendererForRenderFunction(
   renderFunction: RenderFunctionPath,
   options: StoryDocsContext
 ): StaticStoryRenderer | undefined {
-  const renderObject = returnedObjectExpression(renderFunction.node);
-  const templateConfig = renderObject
-    ? readTemplateRenderConfig(renderObject, options.importBindings)
+  const renderObject = resolveReturnedObjectExpression(renderFunction);
+  if (renderObject) {
+    const resolution = readTemplateRenderConfig(renderObject, options.importBindings, {
+      argsParam: argsParameterName(renderFunction.node),
+      componentImportStatement: options.snippet?.componentImportStatement,
+      componentName: options.snippet?.componentName,
+      source: options.source,
+    });
+    if (resolution.kind === 'bail') {
+      return { kind: 'bail', warning: resolution.warning };
+    }
+    if (resolution.kind === 'config') {
+      return { kind: 'template', ...resolution.config };
+    }
+
+    const setupExpression = setupReturnedRenderExpression(renderObject);
+    if (setupExpression) {
+      return {
+        argsParam: argsParameterName(renderFunction.node),
+        expression: setupExpression,
+        kind: 'h',
+      };
+    }
+  }
+
+  const hExpression = returnedExpressionPath(renderFunction)?.node;
+  return hExpression
+    ? {
+        argsParam: argsParameterName(renderFunction.node),
+        expression: hExpression,
+        kind: 'h',
+      }
     : undefined;
-  return templateConfig ? { kind: 'template', ...templateConfig } : undefined;
+}
+
+function resolveStaticStoryArgs(
+  storyExport: string,
+  docgenArgInfo: VueDocgenArgInfo,
+  options: StoryDocsContext
+): StaticStoryArgs {
+  // A name another module owns stays as written, for the classifier to report.
+  const resolved = options.resolver.resolve(storyExport);
+  return {
+    classified: classifyArgs(resolved.args, docgenArgInfo),
+    unresolved: resolved.unresolved,
+  };
 }
 
 function renderStaticStorySnippet(
-  renderer: StaticStoryRenderer,
-  args: ClassifiedArg[],
-  componentName: string
+  renderer: Exclude<StaticStoryRenderer, { kind: 'bail' }>,
+  classified: ClassifyArgsResult,
+  componentName: string,
+  docgenArgInfo: VueDocgenArgInfo,
+  options: StoryDocsContext
 ): StorySnippetResult | undefined {
+  const componentImportStatement = options.snippet?.componentImportStatement;
+  const { args } = classified;
+
+  // A story without a render function shows the component receiving the args directly.
   if (renderer.kind === 'sfc') {
-    return { imports: [], snippet: renderSfcSnippet({ args, componentName }) };
+    return componentImportStatement
+      ? transformTemplate({
+          args,
+          componentImports: new Map([[componentName, componentImportStatement]]),
+          componentName,
+          importBindings: options.importBindings,
+          template: `<${componentName} v-bind="args" />`,
+          unsetArgs: classified.unset,
+        })
+      : undefined;
+  }
+
+  if (renderer.kind === 'template') {
+    return transformTemplate({
+      args,
+      componentImports: renderer.componentImports,
+      componentName,
+      importBindings: options.importBindings,
+      setup: renderer.setup,
+      template: renderer.template,
+      unsetArgs: classified.unset,
+    });
+  }
+
+  const ctx = createRenderContext();
+  const printed = printH({
+    argsParam: renderer.argsParam,
+    componentImportStatement,
+    componentName,
+    ctx,
+    docgen: docgenArgInfo,
+    importBindings: options.importBindings,
+    node: renderer.expression,
+  });
+  if (!printed) {
+    return undefined;
   }
 
   return transformTemplate({
     args,
-    componentImports: renderer.componentImports,
-    template: renderer.template,
+    componentImports: printed.componentImports,
+    componentName,
+    ctx,
+    importBindings: options.importBindings,
+    template: printed.template,
+    unsetArgs: classified.unset,
   });
 }
 
-function resolveStaticStoryArgs(
-  csf: ParsedCsf,
-  storyExport: string,
-  docgenArgInfo: VueDocgenArgInfo,
-  metaPath: NodePath<t.ObjectExpression> | undefined,
-  storyConfigPath: NodePath<t.ObjectExpression> | undefined
-): StaticStoryArgs {
-  const argsError = argsContainerError(metaPath) ?? argsContainerError(storyConfigPath);
-  if (argsError) {
-    return { kind: 'error', error: argsError };
+/**
+ * The `h()` tree a render object's `setup` returns through its render closure, when nothing else
+ * on the object can change what the story renders.
+ *
+ * @example `render: (args) => ({ setup: () => () => h(C, { label: args.label }) })` -> the `h(...)` call
+ */
+function setupReturnedRenderExpression(renderObject: t.ObjectExpression): t.Expression | undefined {
+  const supported = renderObject.properties.every((property) => {
+    if (t.isSpreadElement(property)) {
+      return false;
+    }
+    const key = keyOf(property);
+    return key === 'setup' || key === 'components' || key === 'inheritAttrs';
+  });
+  if (!supported) {
+    return undefined;
   }
 
-  const metaArgsPath = argsObjectPathFromObjectPath(metaPath);
-  // `Primary.args = { … }` runs after the declaration and replaces its args object outright, so an
-  // assignment wins over inline args rather than merging with them.
-  const storyArgsPath =
-    storyAssignedArgsPath(csf._file.path, storyExport) ??
-    argsObjectPathFromObjectPath(storyConfigPath);
-  if (argsObjectHasSpread(metaArgsPath?.node) || argsObjectHasSpread(storyArgsPath?.node)) {
-    return {
-      kind: 'error',
-      error: {
-        name: 'Unsupported story args',
-        message: 'Story args contain a spread value, which cannot be statically inlined yet.',
-      },
-    };
+  const setup = renderObject.properties.find(
+    (property) => !t.isSpreadElement(property) && keyOf(property) === 'setup'
+  );
+  const setupFn = t.isObjectMethod(setup)
+    ? setup
+    : t.isObjectProperty(setup)
+      ? unwrapExpression(setup.value)
+      : undefined;
+  if (!setupFn || !t.isFunction(setupFn)) {
+    return undefined;
   }
 
-  return {
-    kind: 'classified',
-    classified: classifyArgs(
-      mergeArgsRecords(
-        argsRecordFromObjectPath(metaArgsPath),
-        argsRecordFromObjectPath(storyArgsPath)
-      ),
-      docgenArgInfo
-    ),
-  };
+  const renderClosure = returnedExpression(setupFn);
+  const closure = renderClosure && unwrapExpression(renderClosure);
+  // A render closure with parameters would receive values the snippet cannot reproduce.
+  if (!closure || !t.isFunction(closure) || closure.params.length > 0) {
+    return undefined;
+  }
+
+  return returnedExpression(closure);
+}
+
+function argsParameterName(renderFunction: RenderFunctionPath['node']): string | undefined {
+  const [parameter] = renderFunction.params;
+  return t.isIdentifier(parameter) ? parameter.name : undefined;
 }
 
 function resolveEffectiveRender(
   storyConfigPath: NodePath<t.ObjectExpression> | undefined,
   metaPath: NodePath<t.ObjectExpression> | undefined,
-  storyDeclaration: NodePath<t.Node>
+  storyDeclaration: NodePath<t.Node>,
+  references: ReferenceContext
 ): RenderResolution {
-  const storyRender = resolveRenderFromObjectPath(storyConfigPath, storyDeclaration);
+  const storyRender = resolveRenderFromObjectPath(storyConfigPath, storyDeclaration, references);
   return storyRender.kind !== 'missing'
     ? storyRender
-    : resolveRenderFromObjectPath(metaPath, storyDeclaration);
+    : resolveRenderFromObjectPath(metaPath, storyDeclaration, references);
 }
 
 function resolveRenderFromObjectPath(
   path: NodePath<t.ObjectExpression> | undefined,
-  storyDeclaration: NodePath<t.Node>
+  storyDeclaration: NodePath<t.Node>,
+  references: ReferenceContext
 ): RenderResolution {
   try {
-    return resolveRenderFunction(path, storyDeclaration);
+    return resolveRenderFunction(path, storyDeclaration, references);
   } catch {
     return { kind: 'unresolved' };
   }
-}
-
-/**
- * Error for an `args` value that is not an object literal and so cannot be statically inlined.
- *
- * @example `{ args: sharedArgs }` → "Unsupported story args"; `{ args: { a: 1 } }` → undefined
- */
-function argsContainerError(path?: NodePath<t.ObjectExpression>): StoryDoc['error'] | undefined {
-  const value = propertyValue(path?.node, ARGS_PROPERTY);
-  if (!value) {
-    return undefined;
-  }
-
-  if (t.isObjectExpression(value)) {
-    return undefined;
-  }
-
-  if (t.isIdentifier(value)) {
-    return {
-      name: 'Unsupported story args',
-      message: `Arg "args" references "${value.name}", which cannot be statically inlined yet.`,
-    };
-  }
-
-  return {
-    name: 'Unsupported story args',
-    message: 'Story args must be an object literal to be statically inlined.',
-  };
 }

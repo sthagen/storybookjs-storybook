@@ -6,7 +6,7 @@ import type { Violation } from './types.ts';
 export interface CompareArgTypesOptions {
   /** Waive the legacy Angular pipeline's invented defaults, which must not be ratcheted. */
   legacyBaseline?: boolean;
-  /** Also gate `table.type.summary` text and `table.type.required`, for a same-engine baseline. */
+  /** Also gate `table.type.summary` text and the `required` flag, for a same-engine baseline. */
   strictTable?: boolean;
 }
 
@@ -25,7 +25,8 @@ export function compareArgTypes(
   const violations: Violation[] = [];
   for (const [arg, baseEntry] of Object.entries(baseline)) {
     // ES-private `#member`s are inaccessible outside their class; legacy Compodoc records them
-    // anyway, and the modern extractor deliberately drops them. Their loss never gates.
+    // anyway, and the modern extractor only surfaces them under `propsTable: 'all'`. Their loss
+    // never gates.
     if (arg.startsWith('#')) {
       continue;
     }
@@ -61,6 +62,7 @@ export function compareArgTypes(
       });
     }
     violations.push(...compareTypeSummary(arg, baseEntry, candidateEntry, options));
+    violations.push(...compareRequired(arg, baseEntry, candidateEntry, options));
     const baseType = baseEntry.type;
     const candidateType = candidateEntry.type;
     if (baseType != null) {
@@ -115,8 +117,8 @@ const isRecordedSummary = (summary: unknown, legacyBaseline: boolean): boolean =
   );
 };
 
-// `table.type` is loosely typed upstream - `required` is a corpus field the csf type does not
-// declare - hence the unknown-safe reads.
+// `table.type` is loosely typed upstream and a recorded corpus can carry anything in it, hence the
+// unknown-safe reads.
 function compareTypeSummary(
   arg: string,
   baseEntry: StrictInputType,
@@ -146,18 +148,31 @@ function compareTypeSummary(
       message: `table.type.summary changed: baseline ${JSON.stringify(baseSummary)}, candidate ${JSON.stringify(candidateSummary)}`,
     });
   }
+  return violations;
+}
+
+// `canonicalType` strips `required` so a type-fidelity comparison ignores it, which leaves this the
+// only gate on the flag. It reads the sbType because that is where `SBBaseType` declares it.
+function compareRequired(
+  arg: string,
+  baseEntry: StrictInputType,
+  candidateEntry: StrictInputType,
+  options: CompareArgTypesOptions
+): Violation[] {
   if (
-    options.strictTable === true &&
-    baseTableType.required === true &&
-    candidateTableType.required !== true
+    options.strictTable !== true ||
+    baseEntry.type?.required !== true ||
+    candidateEntry.type?.required === true
   ) {
-    violations.push({
+    return [];
+  }
+  return [
+    {
       arg,
       kind: 'lost-required',
-      message: 'the baseline records table.type.required true but the candidate does not',
-    });
-  }
-  return violations;
+      message: 'the baseline records the arg as required but the candidate does not',
+    },
+  ];
 }
 
 const recordedTypeSummary = (summary: unknown): string | undefined => {
